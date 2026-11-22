@@ -1,21 +1,17 @@
 import math
 import os
+import subprocess
 import time
 
-try:
-    import cv2
-except:
-    os.system('python3 -m pip install opencv-python')
-finally:
-    import cv2
+import cv2
+import mediapipe as mp
 
 try:
-    import mediapipe as mp
-except:
-    os.system('python3 -m pip install mediapipe')
-finally:
-    import mediapipe as mp
-
+    from AppKit import NSEvent  # NSEvent lives in AppKit, not Quartz
+    from Quartz import CGEventPost, kCGHIDEventTap
+    _HAS_QUARTZ = True
+except ImportError:
+    _HAS_QUARTZ = False
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -24,14 +20,14 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
-# Pairs of landmark indices to connect (thumb, index, middle, ring, pinky, palm)[cite: 1]
+# Pairs of landmark indices to connect (thumb, index, middle, ring, pinky, palm)
 HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb[cite: 1]
-    (0, 5), (5, 6), (6, 7), (7, 8),          # index[cite: 1]
-    (5, 9), (9, 10), (10, 11), (11, 12),     # middle[cite: 1]
-    (9, 13), (13, 14), (14, 15), (15, 16),   # ring[cite: 1]
-    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky[cite: 1]
-    (0, 17),                                  # palm edge[cite: 1]
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),   # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+    (0, 17),                                  # palm edge
 ]
 
 THUMB_TIP = 4
@@ -62,49 +58,152 @@ MOVE_DEADZONE_PX = 3.5          # Ignores small movements and rotation jitter
 # Gesture debounce (seconds) so holding fingers together doesn't repeat rapidly
 GESTURE_COOLDOWN_SEC = 1.0
 
-latest_result = None  # updated by the callback, read by the main loop[cite: 1]
+# macOS NX_KEYTYPE constants (from hidsystem/ev_keymap.h)
+NX_KEYTYPE_PLAY = 16
+NX_KEYTYPE_NEXT = 17
+NX_KEYTYPE_PREVIOUS = 18
+NX_SUBTYPE_AUX_CONTROL = 8
+
+latest_result = None  # updated by the callback, read by the main loop
 
 
-def on_result(result, output_image: mp.Image, timestamp_ms: int):  #[cite: 1]
-    global latest_result  #[cite: 1]
-    latest_result = result  #[cite: 1]
+def on_result(result, output_image: mp.Image, timestamp_ms: int):
+    global latest_result
+    latest_result = result
 
 
 def dist_px(p1, p2) -> float:
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
-# Replace these hook bodies with your media player / OS media keys if desired
+# --- macOS System Volume Helpers ---
+def get_macos_volume(default: float = 50.0) -> float:
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", "output volume of (get volume settings)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        val = res.stdout.strip()
+        if val.isdigit():
+            return float(max(0, min(100, int(val))))
+    except Exception:
+        pass
+    return default
+
+
+def set_macos_volume(vol_0_to_100: float) -> None:
+    pct = int(round(max(VOLUME_MIN, min(VOLUME_MAX, vol_0_to_100))))
+    subprocess.Popen(
+        ["osascript", "-e", f"set volume output volume {pct}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# --- macOS media helpers (Music / Spotify directly, everything else via media keys) ---
+def _is_running(process_name: str) -> bool:
+    res = subprocess.run(["pgrep", "-x", process_name], capture_output=True, check=False)
+    return res.returncode == 0
+
+
+def _osascript(script: str) -> str:
+    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+    if res.stderr.strip():
+        print(f"[Debug] osascript stderr: {res.stderr.strip()}")
+    return res.stdout.strip().lower()
+
+
+def _post_macos_aux_key(nx_key_type: int) -> bool:
+    """Send a system media key (what the keyboard's F7/F8/F9 do). macOS routes it to
+    whichever app currently owns 'Now Playing' (Chrome, Safari, Firefox, ...)."""
+    if not _HAS_QUARTZ:
+        print("[Debug] pyobjc missing: pip install pyobjc-framework-Quartz pyobjc-framework-Cocoa")
+        return False
+    try:
+        for is_down in (True, False):
+            key_state = 0xA if is_down else 0xB
+            data1 = (nx_key_type << 16) | (key_state << 8)
+            ns_ev = NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+                14,  # NSSystemDefined
+                (0, 0),
+                key_state << 8,
+                0,
+                0,
+                None,
+                NX_SUBTYPE_AUX_CONTROL,
+                data1,
+                -1,
+            )
+            CGEventPost(kCGHIDEventTap, ns_ev.CGEvent())
+            time.sleep(0.02)
+        return True
+    except Exception as exc:
+        print(f"[Debug] Media key error: {exc}")
+        return False
+
+
+def _control_active_desktop_player(command: str, label: str = "") -> bool:
+    """Only acts on Spotify/Music if it is running AND currently playing."""
+    for app in ("Spotify", "Music"):
+        if not _is_running(app):  # avoids osascript trying to launch/locate the app
+            continue
+        state = _osascript(f'tell application "{app}" to return (player state as string)')
+        if state == "playing":
+            _osascript(f'tell application "{app}" to {command}')
+            print(f"[Debug] ({label}) targeted {app}")
+            return True
+    return False
+
+
+def _trigger_active_audio_source(app_command: str, nx_key_type: int, label: str) -> None:
+    if _control_active_desktop_player(app_command, label):
+        return
+    # Browser (or anything else): use the system media key, once.
+    if _post_macos_aux_key(nx_key_type):
+        print(f"[Debug] ({label}) sent media key")
+
+
 def on_next_song(state: dict):
     state["last_action"] = "NEXT SONG"
     state["action_time"] = time.monotonic()
     print("[Media] Next song")
+    _trigger_active_audio_source("next track", NX_KEYTYPE_NEXT, "NEXT")
 
 
 def on_prev_song(state: dict):
     state["last_action"] = "PREV SONG"
     state["action_time"] = time.monotonic()
     print("[Media] Previous song")
+    _trigger_active_audio_source("previous track", NX_KEYTYPE_PREVIOUS, "PREV")
 
 
 def on_toggle_play_pause(state: dict):
     state["is_playing"] = not state["is_playing"]
     state["last_action"] = "PLAY" if state["is_playing"] else "PAUSE"
     state["action_time"] = time.monotonic()
-    print(f"[Media] {'Playing' if state['is_playing'] else 'Paused'}")
+    print(f"[Media] Play/Pause -> {'PLAY' if state['is_playing'] else 'PAUSE'}")
+    _trigger_active_audio_source("playpause", NX_KEYTYPE_PLAY, "PLAY_PAUSE")
 
 
-options = HandLandmarkerOptions(  #[cite: 1]
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),  #[cite: 1]
-    running_mode=VisionRunningMode.LIVE_STREAM,  #[cite: 1]
-    num_hands=2,  #[cite: 1]
-    result_callback=on_result,  #[cite: 1]
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.LIVE_STREAM,
+    num_hands=2,
+    result_callback=on_result,
 )
 
-cap = cv2.VideoCapture(0)  #[cite: 1]
-start = time.monotonic()  #[cite: 1]
+cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
 
-volume = 50.0
+start = time.monotonic()
+
+volume = get_macos_volume(50.0)
+last_applied_volume = int(round(volume))
+
 max_travel_px = INITIAL_MAX_TRAVEL_PX
 pinch_anchor_y = None
 prev_contact_y = None
@@ -122,36 +221,36 @@ media_state = {
     "active_pair": None,
 }
 
-with HandLandmarker.create_from_options(options) as landmarker:  #[cite: 1]
-    while cap.isOpened():  #[cite: 1]
-        ok, frame = cap.read()  #[cite: 1]
-        if not ok:  #[cite: 1]
-            break  #[cite: 1]
+with HandLandmarker.create_from_options(options) as landmarker:
+    while cap.isOpened():
+        ok, frame = cap.read()
+        if not ok:
+            break
 
         now = time.monotonic()
-        frame = cv2.flip(frame, 1)  # mirror view[cite: 1]
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  #[cite: 1]
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)  #[cite: 1]
+        frame = cv2.flip(frame, 1)  # mirror view
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
         timestamp_ms = int((now - start) * 1000)
-        landmarker.detect_async(mp_image, timestamp_ms)  #[cite: 1]
+        landmarker.detect_async(mp_image, timestamp_ms)
 
-        if latest_result is not None:  #[cite: 1]
-            h, w, _ = frame.shape  #[cite: 1]
+        if latest_result is not None:
+            h, w, _ = frame.shape
             hands = latest_result.hand_landmarks
 
             if hands:
                 # Track on one hand only (the first detected hand)
                 hand = hands[0]
-                points = [(int(lm.x * w), int(lm.y * h)) for lm in hand]  #[cite: 1]
+                points = [(int(lm.x * w), int(lm.y * h)) for lm in hand]
 
-                # Lines between connected joints[cite: 1]
-                for a, b in HAND_CONNECTIONS:  #[cite: 1]
-                    cv2.line(frame, points[a], points[b], (255, 255, 255), 2)  #[cite: 1]
+                # Lines between connected joints
+                for a, b in HAND_CONNECTIONS:
+                    cv2.line(frame, points[a], points[b], (255, 255, 255), 2)
 
-                # Dots on each joint[cite: 1]
-                for p in points:  #[cite: 1]
-                    cv2.circle(frame, p, 4, (0, 255, 0), -1)  #[cite: 1]
+                # Dots on each joint
+                for p in points:
+                    cv2.circle(frame, p, 4, (0, 255, 0), -1)
 
                 hand_scale = max(dist_px(points[WRIST], points[MIDDLE_MCP]), 1.0)
                 thumb_pt = points[THUMB_TIP]
@@ -225,6 +324,11 @@ with HandLandmarker.create_from_options(options) as landmarker:  #[cite: 1]
                             delta = direction * normalized_step * speed_boost
                             volume = max(VOLUME_MIN, min(VOLUME_MAX, volume + delta))
 
+                            new_vol_int = int(round(volume))
+                            if new_vol_int != last_applied_volume:
+                                set_macos_volume(new_vol_int)
+                                last_applied_volume = new_vol_int
+
                     prev_contact_y = contact_y
                     prev_contact_time = now
                     is_pinching = True
@@ -253,7 +357,7 @@ with HandLandmarker.create_from_options(options) as landmarker:  #[cite: 1]
 
                 cv2.putText(
                     frame,
-                    f"Vol: {volume:.0f} (Max:{max_travel_px:.0f}px)",
+                    f"Vol: {volume:.0f}% (Max:{max_travel_px:.0f}px)",
                     (label_x, label_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -281,9 +385,9 @@ with HandLandmarker.create_from_options(options) as landmarker:  #[cite: 1]
                 candidate_frames = 0
                 media_state["active_pair"] = None
 
-        cv2.imshow("Hand tracking", frame)  #[cite: 1]
-        if cv2.waitKey(1) & 0xFF == ord("q"):  #[cite: 1]
-            break  #[cite: 1]
+        cv2.imshow("Hand tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
-cap.release()  #[cite: 1]
-cv2.destroyAllWindows()  #[cite: 1]
+cap.release()
+cv2.destroyAllWindows()
