@@ -2,8 +2,20 @@ import math
 import os
 import time
 
-import cv2
-import mediapipe as mp
+try:
+    import cv2
+except:
+    os.system('python3 -m pip install opencv-python')
+finally:
+    import cv2
+
+try:
+    import mediapipe as mp
+except:
+    os.system('python3 -m pip install mediapipe')
+finally:
+    import mediapipe as mp
+
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
